@@ -55,14 +55,21 @@ class VideoDepthAnything(nn.Module):
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
 
-    def forward(self, x):
+    def forward(self, x, get_temporal_maps: bool = False, run_efficiently=True):
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
+        # as the number of frames per batch is very large, we need to
+        # reduce the number of frames processed, so that we reduce the computation required per frame
         features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
-        depth = self.head(features, patch_h, patch_w, T)
+        depth = self.head(features, patch_h, patch_w, T, get_temporal_maps=get_temporal_maps)
+        if get_temporal_maps:
+            depth, maps = depth[0], depth[1:]
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
-        return depth.squeeze(1).unflatten(0, (B, T)) # return shape [B, T, H, W]
+        if get_temporal_maps:
+            return depth.squeeze(1).unflatten(0, (B, T)), maps # return shape [B, T, H, W]
+        else:
+            return depth.squeeze(1).unflatten(0, (B, T))
     
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
         frame_height, frame_width = frames[0].shape[:2]
@@ -76,7 +83,7 @@ class VideoDepthAnything(nn.Module):
                 width=input_size,
                 height=input_size,
                 resize_target=False,
-                keep_aspect_ratio=True,
+                 keep_aspect_ratio=True,
                 ensure_multiple_of=14,
                 resize_method='lower_bound',
                 image_interpolation_method=cv2.INTER_CUBIC,

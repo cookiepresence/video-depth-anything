@@ -50,7 +50,7 @@ class DPTHeadTemporal(DPTHead):
                            **motion_module_kwargs)
         ])
 
-    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4):
+    def forward(self, out_features, patch_h, patch_w, frame_length, micro_batch_size=4, get_temporal_maps: bool = False):
         out = []
         for i, x in enumerate(out_features):
             if self.use_clstoken:
@@ -97,7 +97,11 @@ class DPTHeadTemporal(DPTHead):
             ori_type = out.dtype
             with torch.autocast(device_type="cuda", enabled=False):
                 out = self.scratch.output_conv2(out.float())
-            return out.to(ori_type)
+
+            if get_temporal_maps:
+                return out.to(ori_type), path_3, path_4, layer_3, layer_4
+            else:
+                return out.to(ori_type)
         else:
             ret = []
             for i in range(0, batch_size, micro_batch_size):
@@ -111,4 +115,7 @@ class DPTHeadTemporal(DPTHead):
                 with torch.autocast(device_type="cuda", enabled=False):
                     out = self.scratch.output_conv2(out.float())
                 ret.append(out.to(ori_type))
-            return torch.cat(ret, dim=0)
+            if get_temporal_maps:
+                return torch.cat(ret, dim=0), path_3, path_4, layer_3, layer_4
+            else:
+                return torch.cat(ret, dim=0)
