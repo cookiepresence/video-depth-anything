@@ -1,25 +1,24 @@
-from typing import List, Literal, Dict, Any, Optional
+# goal:
+# take video model -- done
+# infer videos under that
+# save each individual inference with image numbers
+# load each image, train on image model
+# profit?
+
+import random
+from typing import Callable, Optional
 from pathlib import Path
-import argparse
 import os
-import tqdm
+
+import einops
 import numpy as np
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from einops import rearrange
+from tqdm import tqdm
+import wandb
 
+from datasets import point_odessey, image_hdf5
 from video_depth_anything.dpt import DepthAnythingV2
 from video_depth_anything.video_depth import VideoDepthAnything
-from dataset import create_depth_dataloaders
-from utils.util import RunningAverageDict, RunningAverage
-
-# Optional wandb import with handling
-try:
-    import wandb
-except ImportError:
-    wandb = None
 
 MODEL_CONFIG = {
     'vits': {'encoder': 'vits', 'features': 64, 'out_channels': [48, 96, 192, 384]},
@@ -31,146 +30,29 @@ MODEL_CONFIG = {
 
 DEVICE = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-def SILogLoss(pred, target, mask=None, variance_focus=0.85):
-    """
-    Compute SILog loss between predicted and target depth maps.
-    """
-    if mask is None:
-        mask = (target > 0).detach()
+SEED = 42
 
-    mask[870:1016, 1570:1829] = 0
+def set_seed(seed):
+    random.seed(seed)  # Python random module.
+    np.random.seed(seed)  # Numpy module.
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    torch.random.manual_seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)  # if you are using multi-GPU.
+    # torch.backends.cudnn.benchmark = cudnn_benchmark
+    # torch.backends.cudnn.deterministic = cudnn_deterministic
 
-    pred = pred[mask]
-    target = target[mask]
-
-    log_diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
-    mean_log_diff_squared = torch.mean(log_diff ** 2)
-    mean_log_diff = torch.mean(log_diff)
-
-    silog_loss = mean_log_diff_squared - variance_focus * (mean_log_diff ** 2)
-    return silog_loss
-
-def GradientMatchingLoss(pred, target, mask=None):
-    """
-    Compute gradient matching loss between predicted and target depth maps.
-    """
-    assert pred.shape == target.shape, "pred and target must have the same shape"
-
-    if mask is None:
-        mask = (target > 0).detach()
-
-    mask[870:1016, 1570:1829] = 0
-
-    pred = torch.where(mask, pred, 0)
-    target = torch.where(mask, target, 0)
-
-    N = torch.sum(mask)
-    log_d_diff = torch.log(pred + 1e-8) - torch.log(target + 1e-8)
-
-    # print(f"Log Diff.: {torch.isnan(log_d_diff).any()}")
-
-    v_grad = torch.abs(log_d_diff[...,:-2,:] - log_d_diff[..., 2:, :])
-    h_grad = torch.abs(log_d_diff[..., :, :-2] - log_d_diff[..., :, 2:])
-
-    # print(f"V. Grad: {torch.sum(v_grad)}; H. Grad: {torch.sum(h_grad)}")
-    
-    return (torch.sum(h_grad) + torch.sum(v_grad)) / N
-
-
-def TemporalGradientMatchingLoss(pred, target, mask=None):
-    assert pred.shape == target.shape, "pred and target must have the same shape"
-
-    if mask is None:
-        mask = (target > 0).detach()
-
-    mask[:, 870:1016, 1570:1829] = 0
-    mask.to(device)
-    
-    pred = torch.where(mask, pred, 0)
-    target = torch.where(mask, target, 0)
-
-    num_frames = pred.shape[0]
-    time_mask = torch.abs(target[1:, :, :] - target[:-1, :, :]) > 0.05 # threshold decided by paper
-    temporal_gm_loss = torch.nn.functional.l1_loss(
-        (torch.abs(pred[1:, :, :] - pred[:-1, :, :])
-         - torch.abs(target[1:, :, :] - target[:-1, :, :])) * time_mask) # ensure that we only sum values that make sense
-    return temporal_gm_loss / (N - 1)
-
-
-def depth_loss_criterion(preds, target, mask=None, variance_focus=0.85, alpha=2.0):
-    """
-    Combined depth estimation loss.
-    """
-    if alpha == 0.0:
-        return SILogLoss(preds, target, mask, variance_focus)
+def loss_criterion(gt: torch.Tensor, pred: torch.Tensor, masks: torch.Tensor):
+    if torch.sum(masks) > 0:
+        gt = torch.where(masks, gt, 0)
+        pred = torch.where(masks, pred, 0)
+        # normalize by number of pixels
+        return torch.sum((gt - pred) ** 2) / torch.sum(masks)
     else:
-        return SILogLoss(preds, target, mask, variance_focus) + alpha * GradientMatchingLoss(preds, target, mask)
+        return None
 
-def feature_distillation_loss(student_features, teacher_features, adaptation_layers=None, weights=None):
-    """
-    Compute MSE loss between student and teacher feature maps.
-    Uses adaptation layers if provided, otherwise applies adaptive pooling
-    if sizes don't match and optional weighting for different levels.
-
-    Args:
-        student_features: List of student feature maps
-        teacher_features: List of teacher feature maps
-        adaptation_layers: List of adaptation layers (or None) for each feature level
-        weights: Optional list of weights for each feature level
-
-    Returns:
-        Total weighted feature distillation loss
-    """
-    if weights is None:
-        # Default: higher weights for deeper features
-        weights = [0.5, 1.0, 1.5, 2.0]
-
-    total = sum(weights)
-    weights = [w/total for w in weights]
-
-    assert len(student_features) == len(teacher_features) == len(weights), \
-        f"Mismatch in feature maps: student={len(student_features)}, teacher={len(teacher_features)}, weights={len(weights)}"
-
-    total_loss = 0
-
-    for i, (s_feat, t_feat, weight) in enumerate(zip(student_features, teacher_features, weights)):
-        # Handle different spatial dimensions with adaptive pooling
-        assert (s_feat.shape == t_feat.shape), "student and teacher feature maps have different shapes!"
-
-        # Normalize features for better training stability
-        s_feat = F.normalize(s_feat, p=2, dim=1)
-        t_feat = F.normalize(t_feat, p=2, dim=1)
-
-        # MSE loss between normalized features
-        loss = F.mse_loss(s_feat, t_feat)
-        total_loss += weight * loss
-
-    return total_loss
-
-def load_student_model(model_name: str, use_registers: bool = False, model_weights: str = None):
-    """
-    Load the student model (DepthAnythingV2).
-    """
-    model_name_r = model_name + '_r' if use_registers else model_name
-    model_config = MODEL_CONFIG[model_name_r]
-    model_path = f'checkpoints/depth_anything_v2_{model_name}.pth'
-
-    depth_anything = DepthAnythingV2(**model_config)
-
-    if model_weights is not None:
-        depth_anything.load_state_dict(torch.load(model_weights, weights_only=True))
-    else:
-        depth_anything.load_state_dict(torch.load(model_path, weights_only=True), strict=False)
-
-    if use_registers:
-        depth_anything.pretrained.load_state_dict(
-            torch.load(f'checkpoints/dinov2-with-registers-{model_name}.pt', map_location=DEVICE, weights_only=True)
-        )
-
-    depth_anything = depth_anything.to(DEVICE)
-    return depth_anything
-
-def load_teacher_model(model_name: str, model_weights: Path, backbone_weights: Optional[Path]):
+def load_vda(model_name: str, model_weights: Path, backbone_weights: Optional[Path]):
     """
     Load the teacher model (VideoDepthAnything).
     """
@@ -178,10 +60,10 @@ def load_teacher_model(model_name: str, model_weights: Path, backbone_weights: O
     video_depth_anything = VideoDepthAnything(**model_config)
 
     # Load weights for the video depth model
-    vda_weights = torch.load(model_weights, map_location=DEVICE, weights_only=True)
+    vda_weights: dict[str, torch.Tensor] = torch.load(model_weights, map_location=DEVICE, weights_only=True)
     if backbone_weights:
         # ensures that we share the same backbone for pretrained and finetuned models
-        da_pretrained_weights = torch.load(backbone_weights, map_location='cpu', weights_only=True)
+        da_pretrained_weights: dict[str, torch.Tensor] = torch.load(backbone_weights, map_location='cpu', weights_only=True)
         for k, v in da_pretrained_weights.items():
             if 'pretrained' in k:
                 vda_weight = video_depth_anything.state_dict()[k]
@@ -192,489 +74,163 @@ def load_teacher_model(model_name: str, model_weights: Path, backbone_weights: O
                 vda_weight = video_depth_anything.state_dict()[k]
                 vda_weights[k] = v
         print("replaced video depth anything backbone with depthanything!")
-    video_depth_anything.load_state_dict(vda_weights, strict=True)
+    _ = video_depth_anything.load_state_dict(vda_weights, strict=True)
 
-    # Set to evaluation mode and don't compute gradients for teacher
-    video_depth_anything = video_depth_anything.to(DEVICE).eval()
-    for param in video_depth_anything.parameters():
-        param.requires_grad = False
-
+    video_depth_anything = video_depth_anything.to(DEVICE)
     return video_depth_anything
 
-@torch.autocast(device_type=DEVICE)
-def distillation_train_step(
-    student_model,
-    teacher_model,
-    train_dataloader,
-    optimizer,
-    scheduler,
-    depth_criterion,
-    distill_lambda=0.5,
-    feature_weights=None,
-    student_target_modules=None,
-    teacher_target_modules=None,
-    sub_batch_size=8
-):
-    """
-    Training step with both depth supervision and feature distillation.
-    Processes data in smaller sub-batches to reduce VRAM usage.
-    
-    Args:
-        student_model: Student model to be trained
-        teacher_model: Teacher model for knowledge distillation
-        train_dataloader: DataLoader for training data
-        optimizer: Optimizer for student model
-        depth_criterion: Loss function for depth prediction
-        distill_lambda: Weight for distillation loss vs depth loss
-        feature_weights: Weights for different feature levels
-        student_target_modules: List of module names in student to extract features from
-        teacher_target_modules: List of module names in teacher to extract features from
-        sub_batch_size: Size of sub-batches to process at once (to save VRAM)
-    """
-    student_model.train()
-    teacher_model.eval()
-    train_loss = RunningAverageDict()
-    batch_train_loss = []
-    scaler = torch.amp.GradScaler()
-    
-    for imgs, depth_maps, metadata in tqdm.tqdm(train_dataloader):
-        if torch.isnan(imgs).any() or torch.isnan(depth_maps).any():
-            print("NaN detected in inputs, skipping batch")
-            continue
-        
-        # Move data to device
-        imgs = imgs.to(DEVICE)  # [batch_size, frames, C, H, W]
-        depth_maps = depth_maps.to(DEVICE).squeeze(1)  # [batch_size, frames, H, W]
-        
-        batch_size = imgs.shape[0]
-        frames = imgs.shape[1]
-        
-        optimizer.zero_grad()
-        
-        # Initialize accumulated losses for the entire batch
-        total_batch_loss = 0
-        depth_batch_loss = 0
-        distill_batch_loss = 0
-        
-        # Teacher forward pass (with no gradients)
-        with torch.no_grad():
-            teacher_output, teacher_features = teacher_model(
-                imgs,
-                get_temporal_maps=True, 
-                run_efficiently=True
-            )
 
-        sub_batch_imgs = rearrange(imgs, "b (f m) c h w -> (b f) m c h w", m=sub_batch_size)
-        sub_batch_depths = rearrange(depth_maps, "b (f m) h w -> (b f) m h w", m=sub_batch_size)
-        sub_batch_teachers = rearrange(teacher_output, "b (f m) h w -> (b f) m h w", m=sub_batch_size)
+def load_depthanything(model_name: str, model_weights: Optional[str] = None) -> DepthAnythingV2:
+    model_config = MODEL_CONFIG[model_name]
+    model_path = f'checkpoints/depth_anything_v2_{model_name}.pth'
+    depth_anything = DepthAnythingV2(**model_config)
+    if model_weights is not None:
+        _ = depth_anything.load_state_dict(torch.load(model_weights, weights_only=True))
+    else:
+        _ = depth_anything.load_state_dict(torch.load(model_path, weights_only=True), strict=False)
 
-        sub_batch_teacher_features = [rearrange(m, "(b f m) c h w -> (b f) m c h w", m=sub_batch_size, b=batch_size) for m in teacher_features]
-        # reshape list to accomodate batches
-        sub_batch_teacher_features = list(zip(*sub_batch_teacher_features))
+    depth_anything = depth_anything.to(DEVICE)
+    return depth_anything
 
-        student_outputs = torch.zeros(*teacher_output.shape)
-        # Process in sub-batches to save VRAM
-        for idx, (sb_imgs, sb_depths, sb_teacher_features) in enumerate(zip(sub_batch_imgs, sub_batch_depths, sub_batch_teacher_features)):
-            # Student forward pass
-            student_output, student_features = student_model(
-                sb_imgs,
-                get_reassembled_maps=True
-            )
-            student_outputs[:, idx * sub_batch_size:(idx + 1) * sub_batch_size, :, :] = student_output
-            
-            # Calculate depth prediction loss
-            # depth_loss = depth_criterion(student_output, sb_depths, alpha=0)
-            depth_loss = torch.tensor(0.0)
 
-            # Calculate feature distillation loss
-            distill_loss = feature_distillation_loss(
-                student_features,
-                sb_teacher_features,
-                weights=feature_weights
-            )
-            
-            # Combined loss for this sub-batch (scaled by sub-batch size proportion)
-            sub_batch_loss = (1 - distill_lambda) * depth_loss + distill_lambda * distill_loss
-            # print(f"Depth Loss: {depth_loss} | Distill Loss: {distill_loss} | Subbatch Loss: {sub_batch_loss}")
-            scaled_loss = sub_batch_loss
-            
-            # Accumulate scaled gradients
-            scaler.scale(scaled_loss).backward()
-            
-            # Accumulate losses for logging
-            total_batch_loss += sub_batch_loss.item()
-            depth_batch_loss += depth_loss.item()
-            distill_batch_loss += distill_loss.item()
-            
-            # Clear memory
-            # del teacher_output, teacher_features, student_output, student_features
-            # torch.cuda.empty_cache()
-        
-        # Update weights once per full batch
-        temporal_loss = TemporalGradientMatchingLoss(student_outputs, teacher_output)
-        scaler.scale(temporal_loss).backward()
+def run_vda_step(vda_model: VideoDepthAnything, train_dataloader, save_path: Path):
+    vda_model = vda_model.to(DEVICE).eval()
+    counter = 0
 
-        temporal_loss = temporal_loss.item()
-        total_batch_loss += temporal_loss
-
-        scaler.step(optimizer)
-        scaler.update()
-        
-        # Record losses
-        train_loss.update({
-            "total_loss": total_batch_loss,
-            "depth_loss": depth_batch_loss,
-            "distill_loss": distill_batch_loss,
-            "temporal_loss": temporal_loss
-        })
-        batch_train_loss.append(total_batch_loss)
-    
-    scheduler.step()
-    return train_loss.get_value(), batch_train_loss
-
-def distillation_eval_step(
-    student_model,
-    val_dataloader,
-    depth_criterion,
-    sport_name=None
-):
-    """
-    Evaluation step for the student model.
-    """
-    from evaluate import evaluate as eval_depth_maps
-
-    student_model.eval()
-    metrics = RunningAverageDict()
-
+    h5_file = h5py.File(save_path, "w")
+    datasets_created = False
+    img_dset: Optional[h5py.Dataset] = None
+    disparity_dset: Optional[h5py.Dataset] = None
+    mask_dset: Optional[h5py.Dataset] = None
 
     with torch.no_grad():
-        for imgs, depth_maps, metadata in tqdm.tqdm(val_dataloader):
-            imgs = imgs.to(DEVICE)
-            depth_maps = depth_maps.to(DEVICE)
-            depth_maps = rearrange(depth_maps, "b t h w -> (b t) h w")
+        for (imgs, disparity_gt, masks) in tqdm(train_dataloader):
+            imgs: torch.Tensor = imgs.to(DEVICE)
+            disparity_gt: torch.Tensor = disparity_gt.to(DEVICE)
+            masks: torch.Tensor = masks.to(DEVICE)
 
-            # Forward pass student model
-            batch_size = imgs.shape[0]
-            imgs_frames = rearrange(imgs, "b t c h w -> t b c h w")
-            student_output_frames = []
-            for frames in imgs_frames:
-                student_output_frames.append(student_model(frames))
-            student_output_frames = torch.cat(student_output_frames)
-            # student_output = rearrange(student_output_frames, "(t b) h w -> b t h w", b=batch_size)
+            # ensure we mask gts where they are 0
+            # dim: [B, S, C, H, W]
+            with torch.autocast(device_type=DEVICE, dtype=torch.float16, enabled=True):
+                disparity_preds: torch.Tensor = vda_model(imgs, over_imgs=False)
+            video_to_imgs: Callable[[torch.Tensor], torch.Tensor] = lambda tensor: einops.rearrange(tensor, 'b s h w -> (b s) h w')
 
-            # Calculate depth prediction loss
-            depth_loss = depth_criterion(student_output_frames, depth_maps)
-            metrics.update({'val_loss': depth_loss.item()})
+            # convert all videos to imgs
+            # [b, s, h, w] -> [n, h, w]
+            imgs = einops.rearrange(imgs, 'b s c h w -> (b s) c h w')
+            disparity_preds = video_to_imgs(disparity_preds)
+            disparity_gt = video_to_imgs(disparity_gt)
+            masks = video_to_imgs(masks)
 
-            # Process each image in the batch
-            for i in range(imgs.size(0)):
-                batch_metrics = eval_depth_maps(
-                    student_output_frames[i],
-                    depth_maps[i],
-                    sport_name=sport_name,
-                    device=DEVICE,
-                    mask_need=True
+            # save all images
+            imgs_np = imgs.cpu().numpy()
+            preds_np = disparity_preds.cpu().numpy()
+            gt_np = disparity_gt.cpu().numpy()
+            masks_np = masks.cpu().numpy()
+
+            # Create datasets on first iteration
+            if not datasets_created:
+                total_images = len(train_dataloader.dataset) * train_dataloader.dataset.sequence_len
+                img_dset = h5_file.create_dataset(
+                    "images",
+                    shape=(total_images,) + imgs_np.shape[1:],
+                    dtype=imgs_np.dtype,
+                    chunks=(4,) + imgs_np.shape[1:]
+                    # compression="lzf"
                 )
-                metrics.update(batch_metrics)
+                disparity_dset = h5_file.create_dataset(
+                    "disparity_preds",
+                    shape=(total_images,) + preds_np.shape[1:],
+                    dtype=preds_np.dtype,
+                    chunks=(4,) + preds_np.shape[1:]
+                    # compression="lzf"
+                )
+                mask_dset = h5_file.create_dataset(
+                    "masks",
+                    shape=(total_images,) + masks_np.shape[1:],
+                    dtype=masks_np.dtype,
+                    chunks=(4,) + masks_np.shape[1:]
+                    # compression="lzf"
+                )
+                datasets_created = True
 
-    return metrics.get_value()
+            # Write to datasets
+            batch_size = imgs_np.shape[0]
+            img_dset[counter:counter + batch_size] = imgs_np
+            disparity_dset[counter:counter + batch_size] = preds_np
+            mask_dset[counter:counter + batch_size] = masks_np
+            counter += batch_size
 
-def distillation_train(
-    student_model,
-    teacher_model,
-    train_dataloader,
-    val_dataloader,
-    epochs,
-    backbone_lr,
-    dpt_head_lr,
-    distill_lambda=0.5,
-    feature_weights=None,
-    use_wandb=False,
-    sport_name=None,
-    experiment_name=None,
-    save_dir="saved_models"
-):
-    """
-    Main distillation training function.
+    h5_file.close()
 
-    Args:
-        student_model: Student model to be trained
-        teacher_model: Teacher model for knowledge distillation
-        train_dataloader: DataLoader for training data
-        val_dataloader: DataLoader for validation data
-        epochs: Number of training epochs
-        backbone_lr: Learning rate for backbone parameters
-        dpt_head_lr: Learning rate for DPT head parameters
-        distill_lambda: Weight for distillation loss vs depth loss
-        feature_weights: Weights for different feature levels
-        use_wandb: Whether to use Weights & Biases for logging
-        sport_name: Optional sport name for evaluation metrics
-        experiment_name: Name for this experiment
-        save_dir: Directory to save model checkpoints
-    """
-    # Set up different parameter groups with different learning rates
-    backbone_params = []
-    head_params = []
-
-    for name, param in student_model.named_parameters():
-        if 'pretrained' in name:
-            backbone_params.append(param)
-        else:
-            head_params.append(param)
-
-    # Set up optimizer with parameter groups
-    optimizer = torch.optim.Adam([
-        {'params': backbone_params, 'lr': backbone_lr},
-        {'params': head_params, 'lr': dpt_head_lr}
-    ])
-    min_lr = dpt_head_lr*1e-1
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, 
-        T_max=epochs,
-        eta_min=min_lr  # This will be scaled for each param group
-    )
-
-    # Define loss function for depth prediction
-    depth_criterion = depth_loss_criterion
-
-    # Set up wandb if enabled
-    if use_wandb and wandb is not None:
-        wandb.init(project="depth_anything_v2_finetuning", name=experiment_name)
-        wandb.config.update({
-            "epochs": epochs,
-            "backbone_lr": backbone_lr,
-            "dpt_head_lr": dpt_head_lr,
-            "distill_lambda": distill_lambda,
-            "train_batch_size": train_dataloader.batch_size,
-            "val_batch_size": val_dataloader.batch_size,
-        })
-
-    # Create directory to save models if it doesn't exist
-    if not os.path.exists(save_dir):
-        os.makedirs(save_dir)
-
-    best_val_loss = float('inf')
-    best_abs_rel = float('inf')
-
-    # Initial validation
-    val_metrics = distillation_eval_step(student_model, val_dataloader, depth_criterion, sport_name)
-    val_loss = val_metrics['val_loss']
-
-    # Print metrics
-    print(f"Epoch 0/{epochs}")
-    print(f"Val Loss: {val_loss:.4f}")
-    print(f"Val Metrics:")
-    for k, v in val_metrics.items():
-        print(f"\t{k}: {v*1e3:.4f}")
-
-    for epoch in range(epochs):
-        # Training step with distillation
-        train_loss, batch_train_loss = distillation_train_step(
-            student_model,
-            teacher_model,
-            train_dataloader,
-            optimizer,
-            scheduler,
-            depth_criterion,
-            distill_lambda=distill_lambda,
-            feature_weights=feature_weights
-        )
-
-        # Validation step
-        val_metrics = distillation_eval_step(
-            student_model,
-            val_dataloader,
-            depth_criterion,
-            sport_name
-        )
-        val_loss = val_metrics['val_loss']
-
-        # Print metrics
-        print(f"Epoch {epoch+1}/{epochs}")
-        print(f"Train Loss: {train_loss['total_loss']:.4f}")
-        print(f"Batch Train loss: {batch_train_loss}")
-        print(f"Depth Loss: {train_loss['depth_loss']:.4f}")
-        print(f"Distill Loss: {train_loss['distill_loss']:.4f}")
-        print(f"Val Loss: {val_loss:.4f}")
-        print(f"Val Metrics:")
-        for k, v in val_metrics.items():
-            print(f"\t{k}: {v*1e3:.4f}")
-
-        # Log to wandb if enabled
-        if use_wandb and wandb is not None:
-            for loss in batch_train_loss:
-                wandb.log({
-                    "epoch": epoch + 1,
-                    "batch_train_loss": loss
-                })
-
-            log_dict = {
-                "epoch": epoch + 1,
-                "train_loss": train_loss['total_loss'],
-                "depth_loss": train_loss['depth_loss'],
-                "distill_loss": train_loss['distill_loss'],
-                **val_metrics
-            }
-            wandb.log(log_dict)
-
-        # Save model if it's the best so far
-        if val_loss < best_val_loss or val_metrics['abs_rel'] < best_abs_rel:
-            best_val_loss = min(best_val_loss, val_loss)
-            best_abs_rel = min(best_abs_rel, val_metrics['abs_rel'])
-            model_path = os.path.join(save_dir, f"best_model_distilled_{experiment_name}.pth")
-            torch.save(student_model.state_dict(), model_path)
-            print(f"Saved best model to {model_path}")
-
-        # Save checkpoint every 5 epochs
-        if (epoch + 1) % 5 == 0:
-            checkpoint_path = os.path.join(save_dir, f"checkpoint_epoch_{epoch+1}_distilled_{experiment_name}.pth")
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': student_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_loss': val_loss,
-            }, checkpoint_path)
-            print(f"Saved checkpoint to {checkpoint_path}")
-
-    # Close wandb run if it was used
-    if use_wandb and wandb is not None:
-        wandb.finish()
-
-def main(
-    student_model_name: Literal['vits', 'vitb', 'vitl', 'vitg'],
-    teacher_model_name: Literal['vits', 'vitb', 'vitl', 'vitg'],
-    teacher_model_weights: Path,
-    teacher_backbone_weights: Path,
-    dataset_root_path: Path,
-    student_model_weights: str = None,
-    sport_name: str = None,
-    seed: int = 42,
-    train_batch_size: int = 8,
-    val_batch_size: int = 8,
-    epochs: int = 30,
-    backbone_lr: float = 1e-5,
-    dpt_head_lr: float = 1e-4,
-    distill_lambda: float = 0.5,
-    use_wandb: bool = False,
-    experiment_name: str = None,
-    use_registers: bool = False
-):
-    """
-    Main function to set up and run distillation training.
-    """
-    # Set random seed for reproducibility
-    torch.manual_seed(seed)
-    np.random.seed(seed)
-
-    # Default experiment name if not provided
-    if experiment_name is None:
-        experiment_name = f"distill_{teacher_model_name}_to_{student_model_name}"
-
-    # Load student model
-    student_model = load_student_model(student_model_name, use_registers, student_model_weights)
-
-    # Load teacher model
-    teacher_model = load_teacher_model(teacher_model_name, teacher_model_weights, teacher_backbone_weights)
-
-    # Create dataloaders
-    train_dataloader, val_dataloader = create_depth_dataloaders(
-        root_dir=dataset_root_path,
-        sport_name=sport_name,
-        train_batch_size=train_batch_size,
-        val_batch_size=val_batch_size,
-        seed=seed
-    )
-
-    # Default feature weights based on model size
-    if student_model_name == teacher_model_name:
-        # If same architecture, use balanced weights
-        feature_weights = [1.0, 1.0, 1.0, 1.0]
-    else:
-        # If different architectures, focus on deeper features
-        feature_weights = [0.5, 1.0, 1.5, 2.0]
-
-    # Train with distillation
-    distillation_train(
-        student_model,
-        teacher_model,
+def run_train_step(
+        da_model: DepthAnythingV2,
         train_dataloader,
-        val_dataloader,
-        epochs,
-        backbone_lr,
-        dpt_head_lr,
-        distill_lambda=distill_lambda,
-        feature_weights=feature_weights,
-        use_wandb=use_wandb,
-        sport_name=sport_name,
-        experiment_name=experiment_name
-    )
+        model_save_path: Path
+):
+    da_model = da_model.to(DEVICE)
+    optimizer = torch.optim.AdamW(da_model.depth_head.parameters(), lr=5e-5)
 
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='Knowledge Distillation from Video to Image Depth Model')
+    # actual training loop
+    for epoch, (imgs, vid_disparities, masks) in enumerate(tqdm(train_dataloader)):
+        imgs = imgs.to(DEVICE)
+        vid_disparities = vid_disparities.to(DEVICE)
+        masks = masks.to(DEVICE)
 
-    # Student model parameters
-    parser.add_argument('--student-model', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'], default='vits',
-                      help='Student model size to use')
-    parser.add_argument('--student-weights', type=str, default=None,
-                      help='Path to pre-trained student model weights (optional)')
-    parser.add_argument('--use-registers', action='store_true',
-                      help='Use DinoV2 backbone with registers for student')
+        optimizer.zero_grad()
 
-    # Teacher model parameters
-    parser.add_argument('--teacher-model', type=str, choices=['vits', 'vitb', 'vitl', 'vitg'], default='vitl',
-                      help='Teacher model size to use')
-    parser.add_argument('--teacher-weights', type=str, required=True,
-                      help='Path to teacher (video depth) model weights')
-    parser.add_argument('--teacher-backbone-weights', type=str, required=False,
-                        help='Path to teacher (video depth) backbone weights (adapting from finetuned depth models)')
+        img_disparities = da_model(imgs)
+        # TODO: write out loss function
+        # TODO: log loss function using wandb
+        # TODO: remove images that have all 0s using masks
+        loss = loss_criterion(vid_disparities, img_disparities, masks)
+        if loss is None:
+            continue
+        # print(loss)
+        wandb.log({"loss": loss})
+        loss.backward()
+        optimizer.step()
 
-    # Dataset parameters
-    parser.add_argument('--dataset-path', type=Path, required=True,
-                      help='Path to the dataset root directory')
-    parser.add_argument('--sport-name', type=str, default=None,
-                      help='Optional sport name filter for dataset')
+        # save model after every 1000 epochs
+        if epoch % 1000 == 0:
+            torch.save(da_model.state_dict(), model_save_path)
+    torch.save(da_model.state_dict(), model_save_path)
 
-    # Training parameters
-    parser.add_argument('--seed', type=int, default=42,
-                      help='Random seed for reproducibility')
-    parser.add_argument('--train-batch-size', type=int, default=8,
-                      help='Batch size for training')
-    parser.add_argument('--val-batch-size', type=int, default=8,
-                      help='Batch size for validation')
-    parser.add_argument('--epochs', type=int, default=30,
-                      help='Number of training epochs')
-    parser.add_argument('--backbone-lr', type=float, default=1e-6,
-                      help='Learning rate for backbone parameters')
-    parser.add_argument('--head-lr', type=float, default=1e-5,
-                      help='Learning rate for DPT head parameters')
-    parser.add_argument('--distill-lambda', type=float, default=0.5,
-                      help='Weight for distillation loss vs depth loss (0-1)')
+set_seed(SEED)
 
-    # Logging and experiment parameters
-    parser.add_argument('--use-wandb', action='store_true',
-                      help='Enable Weights & Biases logging')
-    parser.add_argument('--experiment-name', type=str, default=None,
-                      help='Name for the experiment run')
+# vid_train_dataset = point_odessey.PointOdessey(
+#     data_root=Path('/scratch/mde/pointodessey'),
+#     splits='train'
+# )
 
-    args = parser.parse_args()
+# video_train_dataloader = torch.utils.data.DataLoader(
+#     vid_train_dataset,
+#     batch_size=4,
+#     shuffle=False,
+#     num_workers=8,
+#     pin_memory=True,
+# )
 
-    main(
-        student_model_name=args.student_model,
-        teacher_model_name=args.teacher_model,
-        teacher_model_weights=args.teacher_weights,
-        teacher_backbone_weights=args.teacher_backbone_weights,
-        dataset_root_path=args.dataset_path,
-        student_model_weights=args.student_weights,
-        sport_name=args.sport_name,
-        seed=args.seed,
-        train_batch_size=args.train_batch_size,
-        val_batch_size=args.val_batch_size,
-        epochs=args.epochs,
-        backbone_lr=args.backbone_lr,
-        dpt_head_lr=args.head_lr,
-        distill_lambda=args.distill_lambda,
-        use_wandb=args.use_wandb,
-        experiment_name=args.experiment_name,
-        use_registers=args.use_registers
-    )
+# vda = load_vda(model_name='vits', model_weights=Path('checkpoints/video_depth_anything_vits.pth'), backbone_weights=None)
+depth_anything = load_depthanything(model_name='vits', model_weights=None)
 
+save_path = Path('/scratch/mde/test.hdf5')
+# run_vda_step(vda_model=vda, train_dataloader=video_train_dataloader, save_path=save_path)
+
+img_train_dataset = image_hdf5.ImageHdf5Dataset(file_path=save_path)
+img_train_dataloader = torch.utils.data.DataLoader(
+    img_train_dataset,
+    batch_size=16,
+    shuffle=True,
+    num_workers=16,
+    pin_memory=True
+)
+
+
+run = wandb.init(
+    project="depthanything-distillation",
+    config={
+        "head_lr": 5e-5,
+        "batch_size": 16
+    })
+run_train_step(da_model=depth_anything, train_dataloader=img_train_dataloader, model_save_path=Path('/scratch/mde/run-01.pt'))
