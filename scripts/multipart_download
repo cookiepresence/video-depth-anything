@@ -1,0 +1,50 @@
+#!/bin/bash
+# Author: Param Aggarwal
+# Multipart parallel downloader in Shell using cURL
+
+if [[ $# -lt 1 ]]; then
+    echo "usage: $0 <url> <output location> <parts>"
+    exit 1
+else
+    url=$1
+fi
+
+if [[ $# -lt 2 ]]; then
+    name="$(expr $url : '.*/\(.*\)')"
+else
+    name=$2
+fi
+
+if [[ $# -lt 3 ]]; then
+    parts=20
+else
+    parts=$3
+fi
+
+size="$(curl --head --silent $url | grep -E "[Cc]ontent-[Ll]ength" | sed 's/[^0-9]*//g')"
+echo Size: $size
+echo Filename: $name
+echo Downloading in $parts parts, c: $c
+
+for (( c=1; c<=$parts; c++ ))
+do
+    from="$(echo $[$size*($c-1)/$parts])"
+    if [[ $c != $parts ]]; then
+        to="$(echo $[($size*$c/$parts)-1])"
+    else
+        to="$(echo $[$size*$c/$parts])"
+    fi 
+
+    out="$(printf $name.'temp.part'$c)"
+    
+   echo "curl --range $from-$to -o $out $url &"
+   curl --silent --range $from-$to -o $out $url &
+done
+
+wait
+
+for (( c=1; c<=$parts; c++ ))
+do
+    cat $(printf $name.'temp.part'$c) >> $name
+    rm $(printf $name.'temp.part'$c)
+done
