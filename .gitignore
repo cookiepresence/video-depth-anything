@@ -5,3 +5,8 @@ __pycache__
 */__pycache__
 *.pyc
 gradio*
+saved_models/
+logs/
+wandb/
+/artifacts/
+/assets/*.mp4
