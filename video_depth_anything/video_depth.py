@@ -19,6 +19,7 @@ import cv2
 from tqdm import tqdm
 import numpy as np
 import gc
+import einops
 
 from .dinov2 import DINOv2
 from .dpt_temporal import DPTHeadTemporal
@@ -54,22 +55,58 @@ class VideoDepthAnything(nn.Module):
         self.pretrained = DINOv2(model_name=encoder)
 
         self.head = DPTHeadTemporal(self.pretrained.embed_dim, features, use_bn, out_channels=out_channels, use_clstoken=use_clstoken, num_frames=num_frames, pe=pe)
+        self.num_frames = num_frames
 
-    def forward(self, x, get_temporal_maps: bool = False, run_efficiently=True):
+    def forward(self, x, get_temporal_maps: bool = False, run_efficiently=False, over_imgs=False):
+        if over_imgs:
+            B = x.shape[0]
+            # fill remaining frames with zeros
+            rem_frames = self.num_frames - (B % self.num_frames)
+            if rem_frames != 32:
+                print(f"adding {rem_frames} frames!")
+                x = torch.cat((x, torch.zeros(rem_frames, *x.shape[1:]).to(x.get_device())))
+            print(x.shape)
+            x = einops.rearrange(x, '(b s) c h w -> b s c h w', s=self.num_frames)
+
         B, T, C, H, W = x.shape
         patch_h, patch_w = H // 14, W // 14
         # as the number of frames per batch is very large, we need to
         # reduce the number of frames processed, so that we reduce the computation required per frame
-        features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
+
+        # process frames one by one in the intermidiate layers if efficiency is required
+        if run_efficiently:
+            mini_batch_size = 2
+            num_frames = B * T
+            num_mini_batches = num_frames // mini_batch_size
+
+            x = einops.rearrange(x, 'b (m t) c h w -> (b t) m c h w', m=mini_batch_size)
+            features = [self.pretrained.get_intermediate_layers(
+                    _x.unsqueeze(0).flatten(0, 1),
+                    self.intermediate_layer_idx[self.encoder],
+                    return_class_token=True
+                ) for _x in x]
+            print(len(features), len(features[0]), len(features[0][0]), features[0][0][0].shape, features[0][0][1].shape)
+        else:
+            features = self.pretrained.get_intermediate_layers(x.flatten(0,1), self.intermediate_layer_idx[self.encoder], return_class_token=True)
         depth = self.head(features, patch_h, patch_w, T, get_temporal_maps=get_temporal_maps)
         if get_temporal_maps:
             depth, maps = depth[0], depth[1:]
         depth = F.interpolate(depth, size=(H, W), mode="bilinear", align_corners=True)
         depth = F.relu(depth)
-        if get_temporal_maps:
-            return depth.squeeze(1).unflatten(0, (B, T)), maps # return shape [B, T, H, W]
+        depth_maps = depth.squeeze(1)
+        # if we are taking imgs as input, ensure to flatten correctly
+        if over_imgs:
+            depth_maps = depth_maps.unflatten(0, (B * T,))
+            # if we added extra frames: remove them
+            if rem_frames != 32:
+                depth_maps = depth_maps[:-rem_frames]
         else:
-            return depth.squeeze(1).unflatten(0, (B, T))
+            depth_maps = depth_maps.unflatten(0, (B, T))
+
+        if get_temporal_maps:
+            return depth_maps, maps # return shape [B, T, H, W]
+        else:
+            return depth_maps
     
     def infer_video_depth(self, frames, target_fps, input_size=518, device='cuda', fp32=False):
         frame_height, frame_width = frames[0].shape[:2]
