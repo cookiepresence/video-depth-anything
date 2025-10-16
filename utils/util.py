@@ -79,26 +79,6 @@ from PIL import Image
 from torchvision import transforms
 from torch.utils.data import DataLoader, Dataset
 
-
-# class ImageDataset(Dataset):
-#     def __init__(self, image_files):
-#         self.image_files = image_files
-#         self.transform = transforms.ToTensor()
-
-#     def __len__(self):
-#         return len(self.image_files)
-
-#     def __getitem__(self, idx):
-#         img = Image.open(self.image_files[idx])
-#         img_mode = img.mode
-#         if img.mode != 'I':
-#             # raise ValueError(f"Image {self.image_files[idx]} is not a 16-bit PNG image")
-#             img = img.convert('I')
-#         img_data = np.array(img)
-#         tensor = torch.from_numpy(img_data).float()
-#         return tensor
-#         #return self.transform(img)
-
 """
 Licence MIT
 
@@ -205,23 +185,27 @@ def compute_errors(gt, pred):
             'rmse_log': Root mean squared error on the log scale
             'silog': Scale invariant log error
     """
+    # if all params are empty
+    if len(gt) == 0 or len(pred) == 0:
+        return {'empty': True}
+    epsilon = 1e-6
 
-
-    abs_rel = np.mean(np.abs(gt - pred) / gt)
-    sq_rel = np.mean(((gt - pred) ** 2) / gt)
+    abs_rel = np.mean(np.abs(gt - pred) / (gt+epsilon))
+    sq_rel = np.mean(((gt - pred) ** 2) / (gt+epsilon))
 
     rmse = (gt - pred) ** 2
     rmse = np.sqrt(rmse.mean())
-    rmse_log = (np.log(gt) - np.log(pred)) ** 2
+    # print(np.sum(gt <= 0), np.sum(pred <= 0))
+    rmse_log = (np.log(gt + 1e-6) - np.log(pred + 1e-6)) ** 2
     rmse_log = np.sqrt(rmse_log.mean())
 
-    err = np.log(pred) - np.log(gt)
+    err = np.log(pred + 1e-6) - np.log(gt + 1e-6)
     silog = np.sqrt(np.mean(err ** 2) - np.mean(err) ** 2) * 100
 
     return dict(abs_rel=abs_rel, rmse=rmse, rmse_log=rmse_log,
                 silog=silog, sq_rel=sq_rel)
 
-def compute_metrics(gt, pred, mask_score, sport, mask_needed=False):
+def compute_metrics(pred, gt, mask):
     """
     This code creates a mask of the same size as the ground truth and prediction, 
     and then modifies the mask based on the sport and the values in the ground truth and prediction. 
@@ -237,16 +221,6 @@ def compute_metrics(gt, pred, mask_score, sport, mask_needed=False):
         dict: Dictionary containing the error metrics computed by the 'compute_errors' function, 
         applied to the areas of the ground truth and prediction indicated by the mask.
     """
-    mask = np.ones(pred.shape, dtype=np.bool_)
-
-    if sport == "basketball" and mask_needed:
-        # print("here")
-        mask[870:1016, 1570:1829] = False
-    if sport == "football" and mask_score and mask_needed:
-        # print("in the problem")
-        mask[70:122, 95:612] = False
-
-
     pred = pred.squeeze().cpu().numpy()
     mask[pred <= 0] = False
     mask[np.isinf(pred)] = False
@@ -257,4 +231,8 @@ def compute_metrics(gt, pred, mask_score, sport, mask_needed=False):
     mask[np.isinf(gt)] = False
     mask[np.isnan(gt)] = False
 
+    mask = mask.cpu().numpy()
+
+    # print(f"gts: {np.min(gt[mask])} -> {np.max(gt[mask])}")
+    # print(f"preds: {np.min(pred[mask])} -> {np.max(pred[mask])}")
     return compute_errors(gt[mask], pred[mask])
