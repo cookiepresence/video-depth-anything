@@ -1,7 +1,7 @@
 import pathlib
 from itertools import chain
 
-from typing import Optional, Literal
+from typing import Optional, Literal, Callable
 
 import albumentations as A
 import cv2
@@ -163,37 +163,38 @@ class BaseDataset(torch.utils.data.Dataset):
         # assume that we need to send video frames instead of image frames
         self.is_video_dataset = is_video_dataset
 
-        if augmentations is None:
-            # Define augmentation pipeline
-            if self.is_video_dataset:
-                self.augmentations = v2.Compose([
-                    v2.RandomHorizontalFlip(p=0.5),
-                ])
-            else:
-                # borrowed from: https://github.com/aharley/pips2/blob/master/datasets/pointodysseydataset.py#L132
-                self.color_augmentations = A.ReplayCompose([
-                    A.GaussNoise(p=0.2),
-                    A.OneOf([
-                        A.MotionBlur(p=0.2),
-                        A.MedianBlur(blur_limit=3, p=0.1),
-                        A.Blur(blur_limit=3, p=0.1),
-                    ], p=0.2),
-                    A.OneOf([
-                        A.CLAHE(clip_limit=2),
-                        A.Sharpen(),
-                        A.Emboss(),
-                    ], p=0.2),
-                    A.RGBShift(p=0.5),
-                    A.RandomBrightnessContrast(p=0.5),
-                    A.RandomGamma(p=0.5),
-                    A.HueSaturationValue(p=0.3),
-                    A.ImageCompression(quality_lower=50, quality_upper=100, p=0.3),
-                ], p=0.8)
-                self.augmentations = v2.Compose([
-                    v2.RandomHorizontalFlip(p=0.5),
-                ])
-        else:
-            self.augmentations = augmentations
+        self.augmentations: Callable[[dict[str, torch.Tensor]], dict[str, torch.Tensor]] = lambda x: x
+        # if augmentations is None:
+        #     # Define augmentation pipeline
+        #     if self.is_video_dataset:
+        #         self.augmentations = v2.Compose([
+        #             v2.RandomHorizontalFlip(p=0.5),
+        #         ])
+        #     else:
+        #         # borrowed from: https://github.com/aharley/pips2/blob/master/datasets/pointodysseydataset.py#L132
+        #         self.color_augmentations = A.ReplayCompose([
+        #             A.GaussNoise(p=0.2),
+        #             A.OneOf([
+        #                 A.MotionBlur(p=0.2),
+        #                 A.MedianBlur(blur_limit=3, p=0.1),
+        #                 A.Blur(blur_limit=3, p=0.1),
+        #             ], p=0.2),
+        #             A.OneOf([
+        #                 A.CLAHE(clip_limit=2),
+        #                 A.Sharpen(),
+        #                 A.Emboss(),
+        #             ], p=0.2),
+        #             A.RGBShift(p=0.5),
+        #             A.RandomBrightnessContrast(p=0.5),
+        #             A.RandomGamma(p=0.5),
+        #             A.HueSaturationValue(p=0.3),
+        #             A.ImageCompression(quality_lower=50, quality_upper=100, p=0.3),
+        #         ], p=0.8)
+        #         self.augmentations = v2.Compose([
+        #             v2.RandomHorizontalFlip(p=0.5),
+        #         ])
+        # else:
+        #     self.augmentations = augmentations
 
         self.resize_transform = Resize(
             width=self.crop_size,
@@ -262,6 +263,7 @@ class BaseDataset(torch.utils.data.Dataset):
         
         # Apply same geometric transforms to all modalities
         # For v2 transforms, we can pass multiple tensors
+        # TODO: remove this and replace with proper augmentations
         augmented = self.augmentations({
             'image': image,
             'disparity': disparity, 

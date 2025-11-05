@@ -96,18 +96,18 @@ class PointOdessey(base.BaseDataset):
                                 0)
         return disparity
 
-    @override                
+    @override
     def __getitem__(self, idx: int):
         selected_scenes: list[tuple[str | pathlib.Path, str | pathlib.Path]] = self.scenes[idx * self.sequence_len
                                       :(idx + 1) * self.sequence_len]
         if self.is_video_dataset:
             data = [self.__getitem_helper__(img, depth) for img, depth in selected_scenes]
-            
+
             images, depths, masks = zip(*data)
             images = torch.stack(images)
             depths = torch.stack(depths)
             masks = torch.stack(masks)
-                    
+
             return images, depths, masks
         else:
             assert len(selected_scenes) == 1
@@ -121,13 +121,14 @@ class PointOdessey(base.BaseDataset):
                 # load images and masks as black
                 image = np.zeros((*self.shape, 3), dtype=np.float32)
                 depth_img = np.zeros(self.shape, dtype=np.float32)
+                # is entirely masked out as we do not want to evaluate loss on this (for obvious reasons)
                 mask = np.zeros(self.shape, dtype=np.float32)
             case ('blank', _) | (_, 'blank'):
                 assert False
             case (_, _):
                 image = Image.open(img).convert('RGB')
                 depth_img = Image.open(depth)
-                
+
                 image = np.array(image)
                 depth_img = np.array(depth_img)
                 mask = np.ones_like(depth_img)
@@ -141,4 +142,3 @@ class PointOdessey(base.BaseDataset):
         image, disparity, mask = self.apply_augmentations(image, disparity, mask)
 
         return image, disparity, mask
-
