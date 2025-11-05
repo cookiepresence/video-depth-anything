@@ -246,12 +246,16 @@ def run_train_step(
             )
         )
         wandb.log({"grad_norm": total_norm})
+        # ensure that grad norm is clipped
+        # TODO: make this adaptable
+        torch.nn.utils.clip_grad_norm_(da_model, 5)
         optimizer.step()
 
         # save model after every 1000 epochs
         if epoch % 1000 == 0:
-            torch.save(da_model.state_dict(), model_save_path)
-    torch.save(da_model.state_dict(), model_save_path)
+            da_model.save_pretrained(model_save_path)
+
+        da_model.save_pretrained(model_save_path)
 
 set_seed(SEED)
 
@@ -289,4 +293,4 @@ run = wandb.init(
         "head_lr": 5e-5,
         "batch_size": 16
     })
-run_train_step(da_model=depth_anything, train_dataloader=img_train_dataloader, model_save_path=Path('/scratch/mde/transformers-run-01.pt'))
+run_train_step(da_model=depth_anything, train_dataloader=img_train_dataloader, model_save_path=Path('/scratch/mde/transformers-run-02-gradnorm-clip'))
